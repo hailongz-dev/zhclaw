@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChannelType {
     Telegram,
+    Feishu,
     Slack,
     Discord,
     WeChat,
@@ -16,6 +17,7 @@ impl std::fmt::Display for ChannelType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChannelType::Telegram => write!(f, "telegram"),
+            ChannelType::Feishu => write!(f, "feishu"),
             ChannelType::Slack => write!(f, "slack"),
             ChannelType::Discord => write!(f, "discord"),
             ChannelType::WeChat => write!(f, "wechat"),

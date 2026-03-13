@@ -8,6 +8,14 @@ pub struct Config {
     /// Telegram Bot API Token
     pub telegram_bot_token: String,
 
+    /// 飞书应用 ID（可选）
+    #[serde(default)]
+    pub feishu_app_id: String,
+
+    /// 飞书应用密钥（可选）
+    #[serde(default)]
+    pub feishu_app_secret: String,
+
     /// Agent 命令行模板，如 "claude -p {prompt}"
     pub agent_command_template: String,
 
@@ -96,6 +104,8 @@ mod tests {
     ) -> Config {
         Config {
             telegram_bot_token: token.to_string(),
+            feishu_app_id: String::new(),
+            feishu_app_secret: String::new(),
             agent_command_template: template.to_string(),
             agent_timeout_secs: timeout.unwrap_or(default_timeout_secs()),
             mcp_server_host: default_mcp_host(),

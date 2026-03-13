@@ -15,6 +15,8 @@ fn create_test_config() -> Config {
         agent_command_template: "echo {prompt}".to_string(),
         agent_timeout_secs: 5,
         telegram_bot_token: "test_token".to_string(),
+        feishu_app_id: String::new(),
+        feishu_app_secret: String::new(),
         mcp_server_host: "127.0.0.1".to_string(),
         mcp_server_port: 8000,
         allowed_user_ids: "".to_string(), // 空字符串 = 允许所有用户
@@ -28,6 +30,8 @@ fn create_restricted_config() -> Config {
         agent_command_template: "echo {prompt}".to_string(),
         agent_timeout_secs: 5,
         telegram_bot_token: "test_token".to_string(),
+        feishu_app_id: String::new(),
+        feishu_app_secret: String::new(),
         mcp_server_host: "127.0.0.1".to_string(),
         mcp_server_port: 8001,
         allowed_user_ids: "user_allowed".to_string(), // 只允许 user_allowed

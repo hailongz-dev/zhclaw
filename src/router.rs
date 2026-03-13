@@ -164,6 +164,8 @@ mod tests {
     fn make_test_config(allowed: &str) -> Config {
         Config {
             telegram_bot_token: "test".to_string(),
+            feishu_app_id: String::new(),
+            feishu_app_secret: String::new(),
             agent_command_template: "echo {prompt}".to_string(),
             agent_timeout_secs: 10,
             mcp_server_host: "0.0.0.0".to_string(),

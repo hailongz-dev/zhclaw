@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::channel::telegram::TelegramAdapter;
+use crate::channel::feishu::FeiShuAdapter;
 use crate::channel::ChannelAdapter;
 use crate::config::Config;
 use crate::executor::process_registry::ProcessRegistry;
@@ -59,7 +60,15 @@ async fn main() -> Result<()> {
     // 6. 初始化渠道适配器
     let (msg_tx, msg_rx) = mpsc::channel(256);
     let telegram = Arc::new(TelegramAdapter::new(&config.telegram_bot_token));
-    let adapters: Vec<Arc<dyn ChannelAdapter>> = vec![telegram.clone()];
+    
+    let mut adapters: Vec<Arc<dyn ChannelAdapter>> = vec![telegram.clone()];
+    
+    // 如果配置了飞书，添加飞书适配器
+    if !config.feishu_app_id.is_empty() && !config.feishu_app_secret.is_empty() {
+        let feishu = Arc::new(FeiShuAdapter::new(&config.feishu_app_id, &config.feishu_app_secret));
+        adapters.push(feishu);
+        info!("飞书机器人适配器已启用");
+    }
 
     // 7. 启动 MCP Server (HTTP, 后台)
     let mcp_host = config.mcp_server_host.clone();
