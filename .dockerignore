@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Build artifacts
+target/
+*.o
+*.a
+*.so
+.DS_Store
+
+# Dependencies
+Cargo.lock
+
+# Environment
+.env
+.env.local
+
+# Test outputs
+*.log
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
