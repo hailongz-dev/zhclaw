@@ -40,7 +40,14 @@ async fn main() -> Result<()> {
 
     // 4. 初始化共享状态
     let process_registry = Arc::new(ProcessRegistry::new());
-    let timer_manager = Arc::new(TimerManager::new());
+    
+    // 初始化 TimerManager 并从数据库恢复定时任务
+    let timer_manager = Arc::new(
+        TimerManager::new_with_db("timers.db")
+            .await
+            .expect("Failed to initialize timer database"),
+    );
+    timer_manager.load_from_db().await.ok(); // 加载已保存的定时任务
 
     // 5. 初始化 Agent Executor
     let executor = Arc::new(AgentExecutor::new(
@@ -79,25 +86,66 @@ async fn main() -> Result<()> {
         let exec = scheduler_executor.clone();
         let adapters = scheduler_adapters.clone();
         async move {
-            info!("定时任务触发: {}", timer.name);
+            info!("定时任务触发: {} (cron: {})", timer.name, timer.cron_expr);
+            let start_time = chrono::Utc::now();
+            
             match exec.execute(&timer.prompt, &timer.chat_id).await {
                 Ok(output) => {
-                    // 找到对应 adapter 发送结果
+                    let elapsed = chrono::Utc::now().signed_duration_since(start_time);
+                    let duration_str = match elapsed.num_seconds() {
+                        secs if secs < 60 => format!("{}s", secs),
+                        secs => format!("{}m {:.0}s", secs / 60, secs % 60),
+                    };
+                    
+                    let notification = format!(
+                        "✅ 定时任务: {}\n⏱️ 耗时: {}\n📋 输出:\n{}",
+                        timer.name, duration_str, output
+                    );
+                    
+                    info!("定时任务 '{}' 执行成功 (耗时: {})", timer.name, duration_str);
+                    
+                    // 通知所有渠道
                     for adapter in &adapters {
-                        let _ = adapter
+                        if let Err(e) = adapter
                             .send_message(crate::channel::OutgoingMessage {
                                 chat_id: timer.chat_id.clone(),
-                                text: format!(
-                                    "⏰ 定时任务 '{}' 输出:\n{}",
-                                    timer.name, output
-                                ),
+                                text: notification.clone(),
                                 parse_mode: None,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::warn!("发送定时任务成功通知失败: {}", e);
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("定时任务 '{}' 执行失败: {}", timer.name, e);
+                    let elapsed = chrono::Utc::now().signed_duration_since(start_time);
+                    let duration_str = match elapsed.num_seconds() {
+                        secs if secs < 60 => format!("{}s", secs),
+                        secs => format!("{}m {:.0}s", secs / 60, secs % 60),
+                    };
+                    
+                    let error_msg = e.to_string();
+                    let notification = format!(
+                        "❌ 定时任务: {}\n⏱️ 耗时: {}\n⚠️ 错误: {}",
+                        timer.name, duration_str, error_msg
+                    );
+                    
+                    tracing::error!("定时任务 '{}' 执行失败 (耗时: {}): {}", timer.name, duration_str, e);
+                    
+                    // 通知所有渠道
+                    for adapter in &adapters {
+                        if let Err(notify_err) = adapter
+                            .send_message(crate::channel::OutgoingMessage {
+                                chat_id: timer.chat_id.clone(),
+                                text: notification.clone(),
+                                parse_mode: None,
+                            })
+                            .await
+                        {
+                            tracing::warn!("发送定时任务失败通知失败: {}", notify_err);
+                        }
+                    }
                 }
             }
         }

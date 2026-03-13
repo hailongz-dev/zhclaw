@@ -8,8 +8,15 @@ use zhclaw::mcp::{serve_http, McpRequest, ZhclawMcpServer, handle_mcp_request};
 use zhclaw::mcp::timer_manager::TimerManager;
 
 /// 测试辅助：创建 MCP server
-fn create_mcp_server() -> ZhclawMcpServer {
-    let timer_manager = Arc::new(TimerManager::new());
+async fn create_mcp_server() -> ZhclawMcpServer {
+    let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
+    let db_path = temp_file.path().to_string_lossy().to_string();
+    drop(temp_file);
+    let timer_manager = Arc::new(
+        TimerManager::new_with_db(&db_path)
+            .await
+            .expect("Failed to create timer manager")
+    );
     let process_registry = Arc::new(ProcessRegistry::new());
     ZhclawMcpServer::new(timer_manager, process_registry)
 }
@@ -17,7 +24,7 @@ fn create_mcp_server() -> ZhclawMcpServer {
 #[tokio::test]
 async fn test_http_service_startup() {
     // 测试：HTTP 服务启动 —— 验证端口可达
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
     
     // 在后台启动服务
     let server_handle = tokio::spawn(async move {
@@ -34,7 +41,7 @@ async fn test_http_service_startup() {
 #[tokio::test]
 async fn test_mcp_initialize_request() {
     // 测试：MCP initialize —— 发送 initialize 请求 → 验证返回 server info
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
     let request = McpRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(1)),
@@ -69,7 +76,7 @@ async fn test_mcp_initialize_request() {
 #[tokio::test]
 async fn test_tools_list() {
     // 测试：tools/list —— 验证返回 6 个 tools
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
     let request = McpRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(serde_json::json!(2)),
@@ -111,7 +118,7 @@ async fn test_tools_list() {
 #[tokio::test]
 async fn test_create_timer_through_mcp() {
     // 测试：create_timer 工具 → list_timers 验证
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     // 创建 timer
     let create_request = McpRequest {
@@ -167,7 +174,7 @@ async fn test_create_timer_through_mcp() {
 #[tokio::test]
 async fn test_delete_timer_through_mcp() {
     // 测试：create → delete → list_timers
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     // 创建 timer
     let create_request = McpRequest {
@@ -238,7 +245,7 @@ async fn test_delete_timer_through_mcp() {
 #[tokio::test]
 async fn test_toggle_timer_through_mcp() {
     // 测试：create → toggle
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     // 创建 timer
     let create_request = McpRequest {
@@ -290,7 +297,7 @@ async fn test_toggle_timer_through_mcp() {
 #[tokio::test]
 async fn test_list_processes_empty() {
     // 测试：list_processes —— 空状态返回空列表
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     let request = McpRequest {
         jsonrpc: "2.0".to_string(),
@@ -318,7 +325,7 @@ async fn test_list_processes_empty() {
 #[tokio::test]
 async fn test_invalid_method() {
     // 测试：无效的方法名称
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     let request = McpRequest {
         jsonrpc: "2.0".to_string(),
@@ -341,7 +348,7 @@ async fn test_invalid_method() {
 #[tokio::test]
 async fn test_create_timer_invalid_cron() {
     // 测试：非法的 cron 表达式
-    let server = create_mcp_server();
+    let server = create_mcp_server().await;
 
     let request = McpRequest {
         jsonrpc: "2.0".to_string(),

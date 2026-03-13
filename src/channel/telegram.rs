@@ -32,6 +32,48 @@ impl TelegramAdapter {
     pub fn bot(&self) -> &Bot {
         &self.bot
     }
+
+    /// 验证 Bot token 有效性（带重试）
+    /// 通过调用 getMe 接口来检查 token 是否有效
+    async fn verify_bot_with_retry(&self) -> anyhow::Result<()> {
+        const MAX_RETRIES: u32 = 5;  // 初始化检查：最多 5 次重试
+        let mut retry_count = 0;
+
+        loop {
+            match self.bot.get_me().await {
+                Ok(me) => {
+                    info!("Telegram Bot 验证成功: @{}", me.user.username.unwrap_or_default());
+                    return Ok(());
+                }
+                Err(e) => {
+                    retry_count += 1;
+
+                    // 分类错误：某些错误应该立即失败，而不是重试
+                    let error_msg = e.to_string();
+                    if error_msg.contains("401") || error_msg.contains("Unauthorized") {
+                        error!("Telegram Bot token 无效: {}", e);
+                        return Err(anyhow::anyhow!("Telegram Bot token 无效，请检查 TELEGRAM_BOT_TOKEN"));
+                    }
+
+                    if retry_count >= MAX_RETRIES {
+                        error!("Telegram Bot 验证失败，重试 {} 次后放弃: {}", MAX_RETRIES, e);
+                        return Err(anyhow::anyhow!(
+                            "Telegram Bot 验证失败: 无法连接到 Telegram API ({})",
+                            e
+                        ));
+                    }
+
+                    // 短期重试：1s, 2s, 3s, 4s, 5s（不是指数级）
+                    let delay_secs = retry_count as u64;
+                    warn!(
+                        "Telegram Bot 验证失败，{}s 后重试 (第 {}/{} 次): {}",
+                        delay_secs, retry_count, MAX_RETRIES, e
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                }
+            }
+        }
+    }
 }
 
 /// 将长文本按指定最大长度切分为多段（字符数，不是字节数）
@@ -59,75 +101,45 @@ impl ChannelAdapter for TelegramAdapter {
     async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
         info!("启动 Telegram 消息监听...");
 
-        // 重试逻辑：指数退避，最多重试 10 次
-        const MAX_RETRIES: u32 = 10;
-        let mut retry_count = 0;
+        // 步骤 1：验证 Bot 有效性（带重试）
+        self.verify_bot_with_retry().await?;
 
-        loop {
-            // 在循环外克隆 tx，避免在循环中重复移动
-            let tx_clone = tx.clone();
+        // 步骤 2：启动 Dispatcher（不设超时，让它长期运行）
+        let tx_clone = tx.clone();
+        let handler = Update::filter_message().endpoint(
+            move |msg: Message, _bot: Bot| {
+                let tx = tx_clone.clone();
+                async move {
+                    if let Some(text) = msg.text() {
+                        let incoming = IncomingMessage {
+                            channel: ChannelType::Telegram,
+                            chat_id: msg.chat.id.to_string(),
+                            user_id: msg
+                                .from
+                                .as_ref()
+                                .map(|u| u.id.to_string())
+                                .unwrap_or_default(),
+                            text: text.to_string(),
+                            timestamp: chrono::Utc::now(),
+                        };
 
-            let handler = Update::filter_message().endpoint(
-                move |msg: Message, _bot: Bot| {
-                    let tx = tx_clone.clone();
-                    async move {
-                        if let Some(text) = msg.text() {
-                            let incoming = IncomingMessage {
-                                channel: ChannelType::Telegram,
-                                chat_id: msg.chat.id.to_string(),
-                                user_id: msg
-                                    .from
-                                    .as_ref()
-                                    .map(|u| u.id.to_string())
-                                    .unwrap_or_default(),
-                                text: text.to_string(),
-                                timestamp: chrono::Utc::now(),
-                            };
-
-                            if let Err(e) = tx.send(incoming).await {
-                                error!("发送消息到路由失败: {}", e);
-                            }
+                        if let Err(e) = tx.send(incoming).await {
+                            error!("发送消息到路由失败: {}", e);
                         }
-                        respond(())
                     }
-                },
-            );
-
-            match tokio::time::timeout(
-                Duration::from_secs(30),
-                Dispatcher::builder(self.bot.clone(), handler)
-                    .enable_ctrlc_handler()
-                    .build()
-                    .dispatch(),
-            )
-            .await
-            {
-                Ok(_) => {
-                    // 正常完成
-                    break;
+                    respond(())
                 }
-                Err(e) => {
-                    // 超时或其他错误
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        error!("Telegram 初始化失败，重试次数已达上限: {}", e);
-                        return Err(anyhow::anyhow!(
-                            "Telegram 初始化失败: 重试 {} 次后放弃",
-                            MAX_RETRIES
-                        ));
-                    }
+            },
+        );
 
-                    // 指数退避: 2^retry_count 秒，最多 120 秒
-                    let delay_secs = std::cmp::min(2_u64.pow(retry_count), 120);
-                    warn!(
-                        "Telegram 初始化失败，{}s 后重试 (第 {}/{} 次): {}",
-                        delay_secs, retry_count, MAX_RETRIES, e
-                    );
-                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-                }
-            }
-        }
+        // 启动 dispatcher，不设超时，让它持续运行
+        Dispatcher::builder(self.bot.clone(), handler)
+            .enable_ctrlc_handler()
+            .build()
+            .dispatch()
+            .await;
 
+        info!("Telegram Dispatcher 已停止");
         Ok(())
     }
 
