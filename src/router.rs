@@ -70,6 +70,7 @@ impl MessageRouter {
             let adapter = self.adapters.get(&msg.channel).cloned();
             let executor = self.executor.clone();
             let chat_id = msg.chat_id.clone();
+            let channel = msg.channel.to_string();
             let text = msg.text.clone();
 
             // 在独立 task 中执行，避免阻塞主循环
@@ -85,7 +86,7 @@ impl MessageRouter {
                         .await;
                 }
 
-                let result = executor.execute(&text, &chat_id).await;
+                let result = executor.execute_with_context(&text, &channel, &chat_id).await;
 
                 if let Some(adapter) = adapter {
                     let reply = match result {

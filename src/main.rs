@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::channel::telegram::TelegramAdapter;
 use crate::channel::feishu::FeiShuAdapter;
@@ -20,6 +20,18 @@ use crate::executor::AgentExecutor;
 use crate::mcp::timer_manager::TimerManager;
 use crate::mcp::ZhclawMcpServer;
 use crate::router::MessageRouter;
+
+fn adapter_matches_timer(adapter: &Arc<dyn ChannelAdapter>, channel: Option<&str>, chat_id: &str) -> bool {
+    if let Some(channel) = channel {
+        return adapter.channel_type().to_string() == channel;
+    }
+
+    match adapter.channel_type() {
+        crate::channel::ChannelType::Telegram => chat_id.parse::<i64>().is_ok(),
+        crate::channel::ChannelType::Feishu => chat_id.starts_with("oc_"),
+        _ => false,
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,15 +71,28 @@ async fn main() -> Result<()> {
 
     // 6. 初始化渠道适配器
     let (msg_tx, msg_rx) = mpsc::channel(256);
-    let telegram = Arc::new(TelegramAdapter::new(&config.telegram_bot_token));
-    
-    let mut adapters: Vec<Arc<dyn ChannelAdapter>> = vec![telegram.clone()];
+    let mut adapters: Vec<Arc<dyn ChannelAdapter>> = Vec::new();
+
+    if !config.telegram_bot_token.is_empty() {
+        let telegram = Arc::new(TelegramAdapter::new(&config.telegram_bot_token));
+        adapters.push(telegram);
+        info!("Telegram 机器人适配器已启用");
+    } else {
+        warn!("未配置 telegram_bot_token，跳过 Telegram 适配器");
+    }
     
     // 如果配置了飞书，添加飞书适配器
     if !config.feishu_app_id.is_empty() && !config.feishu_app_secret.is_empty() {
-        let feishu = Arc::new(FeiShuAdapter::new(&config.feishu_app_id, &config.feishu_app_secret));
-        adapters.push(feishu);
-        info!("飞书机器人适配器已启用");
+        match FeiShuAdapter::new(&config.feishu_app_id, &config.feishu_app_secret) {
+            Ok(feishu) => {
+                let feishu = Arc::new(feishu);
+                adapters.push(feishu);
+                info!("飞书机器人适配器已启用");
+            }
+            Err(e) => {
+                warn!("飞书适配器初始化失败: {}", e);
+            }
+        }
     }
 
     // 7. 启动 MCP Server (HTTP, 后台)
@@ -97,8 +122,9 @@ async fn main() -> Result<()> {
         async move {
             info!("定时任务触发: {} (cron: {})", timer.name, timer.cron_expr);
             let start_time = chrono::Utc::now();
+            let timer_channel = timer.channel.clone();
             
-            match exec.execute(&timer.prompt, &timer.chat_id).await {
+            match exec.execute_with_context(&timer.prompt, timer_channel.as_deref().unwrap_or("unknown"), &timer.chat_id).await {
                 Ok(output) => {
                     let elapsed = chrono::Utc::now().signed_duration_since(start_time);
                     let duration_str = match elapsed.num_seconds() {
@@ -112,9 +138,25 @@ async fn main() -> Result<()> {
                     );
                     
                     info!("定时任务 '{}' 执行成功 (耗时: {})", timer.name, duration_str);
+
+                    let matched_adapters: Vec<_> = adapters
+                        .iter()
+                        .filter(|adapter| {
+                            adapter_matches_timer(adapter, timer.channel.as_deref(), &timer.chat_id)
+                        })
+                        .cloned()
+                        .collect();
+
+                    if matched_adapters.is_empty() {
+                        tracing::warn!(
+                            "定时任务 '{}' 未找到可发送通知的渠道: channel={:?}, chat_id={}",
+                            timer.name,
+                            timer.channel,
+                            timer.chat_id
+                        );
+                    }
                     
-                    // 通知所有渠道
-                    for adapter in &adapters {
+                    for adapter in matched_adapters {
                         if let Err(e) = adapter
                             .send_message(crate::channel::OutgoingMessage {
                                 chat_id: timer.chat_id.clone(),
@@ -141,9 +183,25 @@ async fn main() -> Result<()> {
                     );
                     
                     tracing::error!("定时任务 '{}' 执行失败 (耗时: {}): {}", timer.name, duration_str, e);
+
+                    let matched_adapters: Vec<_> = adapters
+                        .iter()
+                        .filter(|adapter| {
+                            adapter_matches_timer(adapter, timer.channel.as_deref(), &timer.chat_id)
+                        })
+                        .cloned()
+                        .collect();
+
+                    if matched_adapters.is_empty() {
+                        tracing::warn!(
+                            "定时任务 '{}' 未找到可发送失败通知的渠道: channel={:?}, chat_id={}",
+                            timer.name,
+                            timer.channel,
+                            timer.chat_id
+                        );
+                    }
                     
-                    // 通知所有渠道
-                    for adapter in &adapters {
+                    for adapter in matched_adapters {
                         if let Err(notify_err) = adapter
                             .send_message(crate::channel::OutgoingMessage {
                                 chat_id: timer.chat_id.clone(),

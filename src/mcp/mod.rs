@@ -156,9 +156,11 @@ async fn handle_tools_list(
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "定时任务名称"},
-                    "cron_expr": {"type": "string", "description": "Cron 表达式，如 '0 */30 * * * *'"},
+                    "cron_expr": {"type": "string", "description": "Cron 表达式，使用 6 段格式：'秒 分 时 日 月 星期'。示例：'0 */30 * * * *' 表示每 30 分钟执行一次；'0 0 9 * * *' 表示每天 09:00 执行；'0 0 9 * * 1-5' 表示工作日每天 09:00 执行；'0 0 0 1 * *' 表示每月 1 日 00:00 执行。支持 '*'、'*/n'、范围如 '1-5'、列表如 '1,3,5'。"},
                     "prompt": {"type": "string", "description": "要执行的 prompt"},
-                    "chat_id": {"type": "string", "description": "结果发送到的 chat_id"}
+                    "channel": {"type": "string", "description": "可选，通知渠道。支持 telegram / feishu。若不传则尝试从 chat_id 推断"},
+                    "chat_id": {"type": "string", "description": "结果发送到的 chat_id"},
+                    "max_trigger_count": {"type": "integer", "description": "可选，最大触发次数。-1 表示不限制，正整数表示最多触发次数"}
                 },
                 "required": ["name", "cron_expr", "prompt", "chat_id"]
             }
@@ -255,9 +257,15 @@ async fn handle_tools_call(
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let cron_expr = args.get("cron_expr").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let channel = args.get("channel").and_then(|v| v.as_str()).map(str::to_string);
             let chat_id = args.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let max_trigger_count = args.get("max_trigger_count").and_then(|v| v.as_i64()).unwrap_or(-1);
 
-            match server.timer_manager.create_timer(&name, &cron_expr, &prompt, &chat_id).await {
+            match server
+                .timer_manager
+                .create_timer_with_limit(&name, &cron_expr, &prompt, channel.as_deref(), &chat_id, max_trigger_count)
+                .await
+            {
                 Ok(_) => Json(McpResponse {
                     jsonrpc: "2.0".to_string(),
                     id,

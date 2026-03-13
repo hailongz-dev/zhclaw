@@ -39,6 +39,11 @@ impl AgentExecutor {
         self.command_template.replace("{prompt}", &escaped)
     }
 
+    /// 为 prompt 注入渠道上下文，便于 agent 感知消息来源
+    pub fn prompt_with_context(prompt: &str, channel: &str, chat_id: &str) -> String {
+        format!("channel={}, chat_id={}\n{}", channel, chat_id, prompt)
+    }
+
     /// 解析命令字符串为 (程序, 参数列表)，正确处理转义和引号
     pub fn parse_command(command: &str) -> (String, Vec<String>) {
         match shlex::split(command) {
@@ -126,6 +131,12 @@ impl AgentExecutor {
         }
     }
 
+    /// 执行带渠道上下文的 agent 命令，返回输出文本
+    pub async fn execute_with_context(&self, prompt: &str, channel: &str, chat_id: &str) -> Result<String> {
+        let prompt = Self::prompt_with_context(prompt, channel, chat_id);
+        self.execute(&prompt, chat_id).await
+    }
+
     /// 获取进程注册表引用
     pub fn process_registry(&self) -> &Arc<ProcessRegistry> {
         &self.process_registry
@@ -146,6 +157,12 @@ mod tests {
         let exec = make_executor("echo {prompt}", 30);
         let cmd = exec.render_command("hello world");
         assert_eq!(cmd, "echo 'hello world'");
+    }
+
+    #[test]
+    fn test_prompt_with_context() {
+        let prompt = AgentExecutor::prompt_with_context("hello", "telegram", "123");
+        assert_eq!(prompt, "channel=telegram, chat_id=123\nhello");
     }
 
     #[test]

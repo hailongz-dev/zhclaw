@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Telegram Bot API Token
+    #[serde(default)]
     pub telegram_bot_token: String,
 
     /// 飞书应用 ID（可选）

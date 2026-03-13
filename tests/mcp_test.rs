@@ -131,7 +131,8 @@ async fn test_create_timer_through_mcp() {
                 "name": "test_timer",
                 "cron_expr": "0 * * * * *",
                 "prompt": "echo test",
-                "chat_id": "test_chat"
+                "channel": "telegram",
+                "chat_id": "123"
             }
         })),
     };
@@ -187,7 +188,8 @@ async fn test_delete_timer_through_mcp() {
                 "name": "delete_test_timer",
                 "cron_expr": "0 * * * * *",
                 "prompt": "echo test",
-                "chat_id": "test_chat"
+                "channel": "telegram",
+                "chat_id": "123"
             }
         })),
     };
@@ -258,7 +260,8 @@ async fn test_toggle_timer_through_mcp() {
                 "name": "toggle_test_timer",
                 "cron_expr": "0 * * * * *",
                 "prompt": "echo test",
-                "chat_id": "test_chat"
+                "channel": "telegram",
+                "chat_id": "123"
             }
         })),
     };
@@ -292,6 +295,42 @@ async fn test_toggle_timer_through_mcp() {
     .0;
 
     assert!(toggle_response.result.is_some());
+}
+
+#[tokio::test]
+async fn test_create_timer_with_max_trigger_count_through_mcp() {
+    let server = create_mcp_server().await;
+
+    let create_request = McpRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(10)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "create_timer",
+            "arguments": {
+                "name": "limited_timer",
+                "cron_expr": "* * * * * *",
+                "prompt": "echo test",
+                "channel": "telegram",
+                "chat_id": "123",
+                "max_trigger_count": 2
+            }
+        })),
+    };
+
+    let create_response = handle_mcp_request(
+        axum::extract::State(server.clone()),
+        axum::Json(create_request),
+    )
+    .await
+    .0;
+
+    assert!(create_response.result.is_some());
+
+    let timers = server.timer_manager().list_timers().await;
+    let timer = timers.iter().find(|timer| timer.name == "limited_timer").unwrap();
+    assert_eq!(timer.max_trigger_count, 2);
+    assert_eq!(timer.trigger_count, 0);
 }
 
 #[tokio::test]

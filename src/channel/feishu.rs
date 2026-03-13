@@ -1,5 +1,12 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use feishu_sdk::api::{SendMessageBody, SendMessageQuery};
+use feishu_sdk::core::{noop_logger, Config, FEISHU_BASE_URL};
+use feishu_sdk::event::{Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventHandlerResult};
+use feishu_sdk::Client;
+use serde::Serialize;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -9,205 +16,215 @@ use super::types::{ChannelAdapter, ChannelType, IncomingMessage, OutgoingMessage
 /// 飞书消息最大长度
 const FEISHU_MAX_MESSAGE_LENGTH: usize = 4096;
 
-/// 飞书适配器配置
-#[derive(Debug, Clone)]
-pub struct FeiShuAdapter {
-    /// 飞书应用 ID
-    app_id: String,
-    /// 飞书应用密钥
-    app_secret: String,
-    /// HTTP 客户端（可选，用于发送消息）
-    http_client: Arc<reqwest::Client>,
-}
-
-/// 飞书 API 响应结构
-#[derive(Debug, Deserialize)]
-struct FeiShuApiResponse {
-    code: i32,
-    msg: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    data: Option<serde_json::Value>,
-}
-
-/// 飞书获取 tenant_access_token 的响应
-#[derive(Debug, Deserialize)]
-struct FeiShuTokenResponse {
-    code: i32,
-    msg: String,
-    tenant_access_token: Option<String>,
-    #[allow(dead_code)]
-    expire: Option<i32>,
-}
-
-/// 飞书消息结构
-#[derive(Debug, Serialize)]
-struct FeiShuMessage {
-    receive_id: String,
-    msg_type: String,
-    content: String,
-}
-
 /// 飞书消息内容（text 类型）
 #[derive(Debug, Serialize)]
 struct FeiShuTextContent {
     text: String,
 }
 
+/// 飞书适配器 - 使用 feishu-sdk 实现
+/// 
+/// 架构：
+/// 1. 使用 feishu-sdk 的 Client 管理认证和 API 调用
+/// 2. 发送消息：调用 im.v1.message.create API
+/// 3. 接收消息：通过 WebSocket 长连接（飞书推送）
+/// 
+/// 当前 start() 方法保持持续运行，等待 WebSocket 长连接接收消息
+#[derive(Debug, Clone)]
+pub struct FeiShuAdapter {
+    /// feishu-sdk 的 Client，自动处理 token 获取和刷新
+    client: Arc<Client>,
+}
+
+struct MessageEventHandler {
+    client: Arc<Client>,
+    tx: mpsc::Sender<IncomingMessage>,
+}
+
+impl EventHandler for MessageEventHandler {
+    fn event_type(&self) -> &str {
+        "im.message.receive_v1"
+    }
+
+    fn handle(
+        &self,
+        event: Event,
+    ) -> Pin<Box<dyn Future<Output = EventHandlerResult> + Send + '_>> {
+        let tx = self.tx.clone();
+        let client = self.client.clone();
+
+        Box::pin(async move {
+            let Some(payload) = event.event else {
+                warn!("飞书事件缺少 event 字段");
+                return Ok(None);
+            };
+
+            let Some(message) = payload.get("message") else {
+                warn!("飞书消息事件缺少 message 字段");
+                return Ok(None);
+            };
+
+            let Some(chat_id) = message
+                .get("chat_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+            else {
+                warn!("飞书消息事件缺少 chat_id");
+                return Ok(None);
+            };
+
+            let message_id = message
+                .get("message_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+
+            let user_id = payload
+                .get("sender")
+                .and_then(|sender| sender.get("sender_id"))
+                .and_then(|sender_id| {
+                    sender_id
+                        .get("open_id")
+                        .or_else(|| sender_id.get("user_id"))
+                        .or_else(|| sender_id.get("union_id"))
+                })
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let text = message
+                .get("content")
+                .and_then(|value| value.as_str())
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|content| {
+                    content
+                        .get("text")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+
+            let timestamp = message
+                .get("create_time")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<i64>().ok())
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .unwrap_or_else(Utc::now);
+
+            let incoming = IncomingMessage {
+                channel: ChannelType::Feishu,
+                chat_id,
+                user_id,
+                text,
+                timestamp,
+            };
+
+            if let Some(message_id) = message_id {
+                let reaction = serde_json::json!({
+                    "reaction_type": {
+                        "emoji_type": "SMILE"
+                    }
+                });
+
+                if let Err(err) = client
+                    .im_v1_reaction()
+                    .create()
+                    .path_param("message_id", message_id)
+                    .body_json(&reaction)?
+                    .send()
+                    .await
+                {
+                    warn!("飞书自动表情回复失败: {}", err);
+                }
+            }
+
+            if let Err(err) = tx.send(incoming).await {
+                warn!("发送飞书消息到路由失败: {}", err);
+            }
+
+            Ok(None)
+        })
+    }
+}
+
 impl FeiShuAdapter {
     /// 创建飞书适配器
-    pub fn new(app_id: &str, app_secret: &str) -> Self {
-        Self {
-            app_id: app_id.to_string(),
-            app_secret: app_secret.to_string(),
-            http_client: Arc::new(reqwest::Client::new()),
-        }
-    }
+    pub fn new(app_id: &str, app_secret: &str) -> anyhow::Result<Self> {
+        let config = Config::builder(app_id, app_secret)
+            .base_url(FEISHU_BASE_URL)
+            .build();
 
-    /// 获取 tenant_access_token
-    async fn get_access_token(&self) -> anyhow::Result<String> {
-        let body = serde_json::json!({
-            "app_id": &self.app_id,
-            "app_secret": &self.app_secret,
-        });
+        let client = Client::new(config)?;
 
-        let response = self
-            .http_client
-            .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
-            .json(&body)
-            .send()
-            .await?;
-
-        let token_response: FeiShuTokenResponse = response.json().await?;
-
-        if token_response.code != 0 {
-            return Err(anyhow::anyhow!(
-                "飞书 token 获取失败: {}",
-                token_response.msg
-            ));
-        }
-
-        token_response
-            .tenant_access_token
-            .ok_or_else(|| anyhow::anyhow!("飞书返回的 token 为空"))
-    }
-
-    /// 发送单条消息
-    async fn send_single_message(
-        &self,
-        chat_id: &str,
-        text: &str,
-        access_token: &str,
-    ) -> anyhow::Result<()> {
-        let content = FeiShuTextContent {
-            text: text.to_string(),
-        };
-
-        let message = FeiShuMessage {
-            receive_id: chat_id.to_string(),
-            msg_type: "text".to_string(),
-            content: serde_json::to_string(&content)?,
-        };
-
-        let response = self
-            .http_client
-            .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
-            .header("Authorization", format!("Bearer {}", access_token))
-            .json(&message)
-            .send()
-            .await?;
-
-        let api_response: FeiShuApiResponse = response.json().await?;
-
-        if api_response.code != 0 {
-            return Err(anyhow::anyhow!(
-                "飞书消息发送失败: {}",
-                api_response.msg
-            ));
-        }
-
-        Ok(())
+        Ok(Self {
+            client: Arc::new(client),
+        })
     }
 }
 
 #[async_trait]
 impl ChannelAdapter for FeiShuAdapter {
-    async fn start(&self, _tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
-        info!("飞书机器人处于待机状态（通过 Webhook 接收消息）");
-        
-        // 飞书通过 webhook 回调，不需要主动轮询
-        // 这里仅作为占位符，实际消息接收需要在 HTTP 服务器中处理
-        // 应用应该在 main.rs 中实现一个 HTTP 路由来接收飞书的 webhook 回调
-        
-        // 为了让应用能正常启动，这里返回 Ok 并让消息通过主程序的 HTTP 服务器接收
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-        }
+    async fn start(&self, tx: mpsc::Sender<IncomingMessage>) -> anyhow::Result<()> {
+        info!("飞书机器人已启动（WebSocket 长连接模式，使用 feishu-sdk）");
+
+        let dispatcher = EventDispatcher::new(EventDispatcherConfig::new(), noop_logger());
+        dispatcher
+            .register_handler(Box::new(MessageEventHandler {
+                client: self.client.clone(),
+                tx,
+            }))
+            .await;
+
+        let stream_client = self
+            .client
+            .stream()
+            .event_dispatcher(dispatcher)
+            .build()?;
+
+        info!("飞书机器人已进入 WebSocket 消息监听模式");
+        stream_client.start().await?;
+        Ok(())
     }
 
     async fn send_message(&self, msg: OutgoingMessage) -> anyhow::Result<()> {
-        // 发送消息时的重试逻辑
-        const MAX_RETRIES: u32 = 3;
-        let mut retry_count = 0;
+        let query = SendMessageQuery {
+            receive_id_type: Some("chat_id".to_string()),
+        };
 
-        loop {
-            // 获取 access token
-            let token = match self.get_access_token().await {
-                Ok(t) => t,
-                Err(e) => {
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRIES {
-                        return Err(anyhow::anyhow!("飞书 token 获取失败 (重试 {} 次): {}", MAX_RETRIES, e));
-                    }
-                    let delay_secs = 2_u64.pow(retry_count - 1);
-                    warn!(
-                        "飞书 token 获取失败，{}s 后重试 (第 {}/{} 次): {}",
-                        delay_secs, retry_count, MAX_RETRIES, e
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
-                    continue;
-                }
+        // 分割长消息
+        let parts = split_message(&msg.text, FEISHU_MAX_MESSAGE_LENGTH);
+
+        for (idx, part) in parts.iter().enumerate() {
+            let text_to_send = if parts.len() > 1 {
+                format!("[{}/{}]\n{}", idx + 1, parts.len(), part)
+            } else {
+                part.clone()
             };
 
-            // 分割长消息
-            let parts = split_message(&msg.text, FEISHU_MAX_MESSAGE_LENGTH);
+            // 使用 feishu-sdk 的通用 API 接口
+            let content = FeiShuTextContent {
+                text: text_to_send.clone(),
+            };
+            let body = SendMessageBody {
+                receive_id: msg.chat_id.clone(),
+                msg_type: "text".to_string(),
+                content: serde_json::to_string(&content)?,
+                uuid: None,
+            };
 
-            for (idx, part) in parts.iter().enumerate() {
-                let text_to_send = if parts.len() > 1 {
-                    format!("[{}/{}]\n{}", idx + 1, parts.len(), part)
-                } else {
-                    part.clone()
-                };
+            let resp = self
+                .client
+                .im_v1_message()
+                .send_typed(&query, &body, Default::default())
+                .await?;
 
-                match self
-                    .send_single_message(&msg.chat_id, &text_to_send, &token)
-                    .await
-                {
-                    Ok(_) => {
-                        // 消息发送成功
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= MAX_RETRIES {
-                            return Err(anyhow::anyhow!(
-                                "飞书消息发送失败 (重试 {} 次): {}",
-                                MAX_RETRIES, e
-                            ));
-                        }
-
-                        let delay_secs = 2_u64.pow(retry_count - 1);
-                        warn!(
-                            "飞书消息发送失败，{}s 后重试 (第 {}/{} 次): {}",
-                            delay_secs, retry_count, MAX_RETRIES, e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
-                        continue;
-                    }
-                }
+            if resp.code != 0 {
+                return Err(anyhow::anyhow!(
+                    "飞书消息发送失败 (第 {}/{}): {}",
+                    idx + 1,
+                    parts.len(),
+                    resp.msg,
+                ));
             }
-
-            // 所有部分都发送成功
-            break;
         }
 
         Ok(())
@@ -244,7 +261,8 @@ mod tests {
 
     #[test]
     fn test_channel_type_is_feishu() {
-        let adapter = FeiShuAdapter::new("fake_app_id", "fake_secret");
+        let adapter = FeiShuAdapter::new("fake_app_id", "fake_secret")
+            .expect("Failed to create adapter");
         assert_eq!(adapter.channel_type(), ChannelType::Feishu);
     }
 
